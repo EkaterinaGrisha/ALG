@@ -1,3 +1,4 @@
+import codecs
 import re
 import sys
 
@@ -26,9 +27,9 @@ TRANSLIT = {
 }
 
 # Запрещённое слово после нормализации: шафриан / шафриян / шафрийан
-# (+ «сафриан» из транслита s-a-f-r-i-a-n). Ищется в строке, склеенной целиком,
-# поэтому ловит и буквы через пробел/дефис/цифры, и любые окончания.
+# (+ «сафриан» из транслита s-a-f-r-i-a-n), а также оно же задом наперёд.
 TARGET = re.compile(r'[шщс]афри[йи]?[ая]н')
+TARGET_REV = re.compile(r'н[ая][йи]?ирфа[шщс]')
 # Обычное написание «шафран» — только внутри одного слова: при склейке через
 # пробел оно возникает случайно («ваша франшиза» → «вашафраншиза»).
 TARGET_WORD = re.compile(r'[шщс]афран')
@@ -36,73 +37,120 @@ TARGET_WORD = re.compile(r'[шщс]афран')
 HOMOGLYPH_TABLE = str.maketrans(HOMOGLYPH)
 LEET_TABLE = str.maketrans(LEET)
 TRANSLIT_RE = re.compile('|'.join(sorted(TRANSLIT, key=len, reverse=True)))
-HAS_LATIN = re.compile(r'[a-z]')
-HAS_LEET = re.compile('[' + re.escape(''.join(LEET)) + ']')
-NOT_LETTER = re.compile(r'[^a-zа-яёії]')
-NOT_CYR = re.compile(r'[^а-яё]')
-REPEATS = re.compile(r'(.)\1+')
+
+# Все преобразования применяются сразу к большому куску текста (это работает
+# на уровне C), а перевод строки '\n' везде сохраняется — по числу '\n' перед
+# найденным совпадением восстанавливается номер строки.
+NOT_LETTER = re.compile(r'[^a-zа-яёії\n]')       # буквы + границы строк
+NOT_LETTER_WS = re.compile(r'[^a-zа-яёії\s]')    # буквы + пробелы (границы слов)
+NOT_CYR = re.compile(r'[^а-яё\n]')
+NOT_CYR_WS = re.compile(r'[^а-яё\s]')
+NOT_CAPS = re.compile(r'[^A-ZА-ЯЁІЇ\n]')
+REPEATS = re.compile(r'([а-яё])\1+')             # «шаааафриан» → «шафриан»
+CHUNK = 1 << 20      # текст обрабатывается кусками ~1 млн символов по границе строк
 
 
 def translit(s):
     return TRANSLIT_RE.sub(lambda m: TRANSLIT[m.group()], s)
 
 
-def normalize(s):
-    # s — уже только буквы (латиница и кириллица). Два прочтения латиницы:
-    # «по виду» (p → р) и «по звучанию» (sh → ш). Потом оставляем только
-    # кириллицу и схлопываем повторы («шаааафриан» → «шафриан»).
-    out = [s.translate(HOMOGLYPH_TABLE)]
-    if HAS_LATIN.search(s):
-        out.append(translit(s))
-    return [REPEATS.sub(r'\1', NOT_CYR.sub('', v)) for v in out]
+def readings(s, not_cyr):
+    # два прочтения латиницы: «по виду» (p → р) и «по звучанию» (sh → ш);
+    # затем оставляем только кириллицу и схлопываем повторы букв
+    for v in (s.translate(HOMOGLYPH_TABLE), translit(s)):
+        yield REPEATS.sub(r'\1', not_cyr.sub('', v))
 
 
-def bases(text):
-    # текст как есть и текст с цифрами/знаками, прочитанными как буквы
-    low = text.lower().replace('ё', 'е')
-    res = [low]
-    if HAS_LEET.search(low):
-        res.append(low.translate(LEET_TABLE))
-    return res
+def scan(chunk, offset, found):
+    def mark(view, patterns):
+        for pat in patterns:
+            for m in pat.finditer(view):
+                found.add(offset + view.count('\n', 0, m.start()))
 
-
-def suspicious(line):
-    for b in bases(line):
-        # 1) вся строка, склеенная в одно слово (разделители между буквами убраны)
-        joined = normalize(NOT_LETTER.sub('', b))
-        for v in joined:
-            if TARGET.search(v) or TARGET.search(v[::-1]):
-                return True
-        # 2) «шафран» нашёлся в склейке — проверяем, что он внутри одного слова
-        if any(TARGET_WORD.search(v) for v in joined):
-            for word in b.split():
-                for v in normalize(NOT_LETTER.sub('', word)):
-                    if TARGET_WORD.search(v):
-                        return True
+    low = chunk.lower().replace('ё', 'е')
+    for base in (low, low.translate(LEET_TABLE)):   # как есть и цифры → буквы
+        # 1) каждая строка склеена в одно слово: разделители между буквами убраны
+        for v in readings(NOT_LETTER.sub('', base), NOT_CYR):
+            mark(v, (TARGET, TARGET_REV))
+        # 2) «шафран» — внутри одного слова
+        for v in readings(NOT_LETTER_WS.sub('', base), NOT_CYR_WS):
+            mark(v, (TARGET_WORD,))
     # 3) акростих из заглавных букв: «ШАрообразный ФРИтюр АНалитика»
-    caps = ''.join(ch for ch in line if ch.isupper())
-    if len(caps) >= 3:
-        for v in normalize(NOT_LETTER.sub('', caps.lower())):
-            if TARGET.search(v):
-                return True
-    return False
+    caps = NOT_CAPS.sub('', chunk).lower()
+    for v in readings(caps, NOT_CYR):
+        mark(v, (TARGET,))
 
 
-def read_lines_until_eof_with_input():
-    lines = []
+# Быстрый предфильтр (необходимое условие). В любом найденном слове после
+# нормализации «ф» и «р» стоят рядом («…фри…», задом наперёд «…ирф…»,
+# «…фран…»). Нормализация только удаляет не-кириллицу и схлопывает повторы,
+# поэтому в исходной строке между ф/f и р/p/r могут стоять лишь
+# не-кириллические символы и сами ф/р. Для акростиха нужны заглавные Ф/F и Р/P/R.
+# (регистр задан явно: без re.I регулярное выражение работает вдвое быстрее)
+PRE = re.compile(r'[фФfF](?:[^а-яёА-ЯЁ\n]|[фрФР])*[рРpPrR]|[рРpPrR](?:[^а-яёА-ЯЁ\n]|[фрФР])*[фФfF]')
+PRE_CAPS = re.compile(r'[ФF][^\n]*?[РPR]')
+
+
+def scan_all(text, found, index=None):
+    offset = 0               # сколько строк было в предыдущих кусках
+    pos = 0
+    n = len(text)
+    while pos < n:
+        end = n
+        if n - pos > CHUNK:
+            nl = text.find('\n', pos + CHUNK)
+            if nl >= 0:
+                end = nl + 1
+        chunk = text[pos:end]
+        local = set()
+        scan(chunk, offset, local)
+        found.update(local if index is None else (index[k] for k in local))
+        offset += chunk.count('\n')
+        pos = end
+
+
+def read_blocks(size=1 << 22):
+    # Ввод читается блоками и декодируется по частям, чтобы память не зависела
+    # от размера датасета. Каждый блок состоит из целых строк. Строки делятся
+    # только по '\n' — ровно как у input() ('\r' остаётся внутри строки).
+    dec = codecs.getincrementaldecoder('utf-8')(errors='replace')
+    rest = ''
     while True:
-        try:
-            line = input()
-            lines.append(line)
-        except EOFError:
-            break
-    return lines
+        b = sys.stdin.buffer.read(size)
+        if not b:
+            yield rest + dec.decode(b'', True)
+            return
+        s = rest + dec.decode(b)
+        cut = s.rfind('\n')
+        if cut < 0:
+            rest = s
+            continue
+        yield s[:cut + 1]
+        rest = s[cut + 1:]
 
 
 def main():
-    lines = read_lines_until_eof_with_input()
-    res = [str(i + 1) for i, line in enumerate(lines) if suspicious(line)]
-    sys.stdout.write("\n".join(res) + ("\n" if res else ""))
+    # строки-кандидаты, прошедшие предфильтр, и их номера (с нуля)
+    index, cand = [], []
+    base = 0                                 # строк в предыдущих блоках
+    for text in read_blocks():
+        starts = set()
+        for pat in (PRE, PRE_CAPS):
+            for m in pat.finditer(text):
+                starts.add(text.rfind('\n', 0, m.start()) + 1)
+        line_no, prev = base, 0
+        for s in sorted(starts):
+            line_no += text.count('\n', prev, s)
+            prev = s
+            e = text.find('\n', s)
+            index.append(line_no)
+            cand.append(text[s:] if e < 0 else text[s:e])
+        base += text.count('\n')
+
+    found = set()
+    scan_all('\n'.join(cand), found, index)
+    res = sorted(i + 1 for i in found)
+    sys.stdout.write("\n".join(map(str, res)) + ("\n" if res else ""))
 
 
 if __name__ == "__main__":
